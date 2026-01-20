@@ -1,0 +1,4 @@
+{
+  "apiBaseUrl": "http://10.128.132.119:5000/api",
+  "environment": "development"
+}

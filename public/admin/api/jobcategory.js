@@ -1,0 +1,483 @@
+import { getApi, toast, getStoredToken } from './config/_helper.js';
+
+// Frontend pagination + search + reveal display for Users Management
+let api = null;
+// alert(1);
+// //console(api);
+// Simple slugify helper
+function slugify(str) {
+    return String(str).toLowerCase().trim()
+        .replace(/[^a-z0-9\s-_]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-');
+}
+
+// Small helper to escape HTML for safe text insertion
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+(async function () {
+    const nameEl = document.getElementById('jc-name');
+    const slugEl = document.getElementById('jc-slug');
+    const form = document.getElementById('jobCategoryForm');
+    const modalEl = document.getElementById('jobCategoryModal');
+    let bsModal = null;
+    try {
+        api = await getApi();
+        if (window.bootstrap && modalEl) bsModal = new bootstrap.Modal(modalEl);
+        // ensure axios instance includes stored token (if any)
+        try {
+            const token = getStoredToken();
+            if (token) {
+                api.defaults.headers.common['Authorization'] = 'Bearer ' + token;
+                //console('Attached stored token to API instance');
+            }
+        } catch (e) { console.warn('failed attaching token to api', e); }
+        // simple interceptors for debugging requests/responses
+        try {
+            api.interceptors.request.use(req => {
+                // console.debug('API Request', req.method, req.url, req.headers && req.headers.Authorization);
+                return req;
+            }, err => { return Promise.reject(err); });
+            api.interceptors.response.use(res => { return res; }, err => { return Promise.reject(err); });
+        } catch (e) { }
+        if (nameEl && slugEl) {
+            nameEl.addEventListener('input', function (e) {
+                // only auto-fill slug if user hasn't typed a custom slug
+                if (!slugEl.dataset.touched) {
+                    slugEl.value = slugify(e.target.value);
+                }
+            });
+        }
+
+        if (slugEl) {
+            slugEl.addEventListener('input', function () { slugEl.dataset.touched = true; });
+        }
+
+        // Utility: clear and show validation errors for a form
+        function clearValidationErrors(formEl) {
+            if (!formEl) return;
+            const invalids = formEl.querySelectorAll('.is-invalid');
+            invalids.forEach(i => i.classList.remove('is-invalid'));
+            const feedbacks = formEl.querySelectorAll('.invalid-feedback');
+            feedbacks.forEach(f => f.textContent = '');
+        }
+
+        function showValidationErrors(formEl, errors) {
+            if (!formEl || !errors) return;
+            // errors may be { field: ['msg'] } or { field: 'msg' } or array
+            function setFieldError(fieldName, msg) {
+                // try common id patterns
+                const ids = [
+                    `jc-${fieldName}`,
+                    `jc-edit-${fieldName}`,
+                    fieldName,
+                ];
+                for (const id of ids) {
+                    const el = formEl.querySelector(`#${id}`);
+                    if (el) {
+                        el.classList.add('is-invalid');
+                        const fb = formEl.querySelector(`#error-${id}`) || el.parentElement.querySelector('.invalid-feedback');
+                        if (fb) fb.textContent = msg;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            if (Array.isArray(errors)) {
+                errors.forEach(e => {
+                    if (e && e.field && e.message) setFieldError(e.field, e.message);
+                });
+            } else if (typeof errors === 'object') {
+                Object.keys(errors).forEach(k => {
+                    const v = errors[k];
+                    if (Array.isArray(v)) setFieldError(k, v.join(' '));
+                    else setFieldError(k, String(v));
+                });
+            } else if (typeof errors === 'string') {
+                // show generic form error if present
+                const fb = formEl.querySelector('.invalid-feedback'); if (fb) fb.textContent = errors;
+            }
+        }
+
+        if (form) {
+            form.addEventListener('submit', async function (ev) {
+                ev.preventDefault();
+                clearValidationErrors(form);
+                const data = {
+                    name: (document.getElementById('jc-name') || {}).value || '',
+                    slug: (document.getElementById('jc-slug') || {}).value || '',
+                    description: (document.getElementById('jc-desc') || {}).value || ''
+                };
+                const headers = {};
+                const token = getStoredToken();
+                if (token) headers.Authorization = 'Bearer ' + token;
+                try {
+                    const res = await api.post('/job-categories', data, { headers });
+                    // store token if returned
+                    try {
+                        const authHeader = (res.headers && (res.headers.authorization || res.headers['authorization'])) || null;
+                        let returnedToken = null;
+                        if (authHeader) {
+                            const parts = String(authHeader).split(/\s+/);
+                            returnedToken = parts.length === 2 && /^Bearer$/i.test(parts[0]) ? parts[1] : (parts[0] || null);
+                        }
+                        if (!returnedToken && res.data) {
+                            if (res.data.token) returnedToken = res.data.token;
+                            else if (res.data.accessToken) returnedToken = res.data.accessToken;
+                            else if (res.data.data && res.data.data.token) returnedToken = res.data.data.token;
+                        }
+                        if (returnedToken) {
+                            try { localStorage.setItem('token', returnedToken); } catch (e) { console.warn('Cannot store token', e); }
+                            try { api.defaults.headers.common['Authorization'] = 'Bearer ' + returnedToken; } catch (e) { }
+                        }
+                    } catch (e) { console.warn('Failed to read token from response', e); }
+
+                    // success: close modal, reset, reload
+                    try { if (bsModal) bsModal.hide(); } catch (e) { }
+                    form.reset(); if (slugEl) delete slugEl.dataset.touched;
+                    if (typeof loadCategories === 'function') await loadCategories(1);
+                    if (typeof toast !== 'undefined') toast.success('Category created');
+                } catch (err) {
+                    if (err && err.response) {
+                        if (err.response.status === 401) {
+                            if (typeof toast !== 'undefined') toast.error('Unauthorized. Please sign in as admin.');
+                            return;
+                        }
+                        const body = err.response.data || {};
+                        const errors = body.errors || body.error || body.validation || body;
+                        showValidationErrors(form, errors);
+                        if (typeof toast !== 'undefined' && !errors) toast.error('Create failed');
+                        return;
+                    }
+                    console.error(err);
+                    if (typeof toast !== 'undefined') toast.error('Create failed');
+                }
+            });
+        }
+        //console(api);
+
+        // ---- Job category list rendering ----
+        const tbody = document.getElementById('jobcategory-tbody');
+        const paginationEl = document.getElementById('jobcategory-pagination');
+        // Edit modal elements
+        const editModalEl = document.getElementById('jobCategoryEditModal');
+        let bsEditModal = null;
+        const editForm = document.getElementById('jobCategoryEditForm');
+        const editIdEl = document.getElementById('jc-edit-id');
+        const editNameEl = document.getElementById('jc-edit-name');
+        const editSlugEl = document.getElementById('jc-edit-slug');
+        const editDescEl = document.getElementById('jc-edit-desc');
+        if (window.bootstrap && editModalEl) bsEditModal = new bootstrap.Modal(editModalEl);
+        let currentPage = 1;
+        const PAGE_LIMIT = 10;
+
+        function formatDateShort(d) {
+            if (!d) return '';
+            const dt = new Date(d);
+            if (isNaN(dt.getTime())) return '';
+            return dt.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+        }
+
+        async function loadCategories(page = 1, limit = PAGE_LIMIT, q = '') {
+            if (!api) api = await getApi();
+            try {
+                // show skeleton placeholders while loading
+                showSkeleton(limit);
+                const params = { page, limit };
+                if (q) params.q = q;
+                const res = await api.get('/job-categories', { params });
+                //console(res);
+                const body = res && res.data ? res.data : null;
+                if (!body) return renderEmpty();
+                const items = Array.isArray(body.data) ? body.data : (Array.isArray(body) ? body : []);
+                
+                // Check if no items found
+                if (items.length === 0) {
+                    return renderEmpty();
+                }
+                
+                const meta = body.meta || { page: page, limit: limit, total: items.length };
+                renderRows(items);
+                renderPagination(meta.page || page, meta.limit || limit, meta.total || items.length);
+            } catch (err) {
+                console.error('Failed to load job categories', err);
+                if (typeof toast !== 'undefined') toast.error('Failed to load job categories');
+                renderEmpty();
+            }
+        }
+
+        function renderEmpty() {
+            if (!tbody) return;
+            tbody.innerHTML = '<tr class="nk-tb-item"><td class="nk-tb-col" colspan="5">No job categories found.</td></tr>';
+            if (paginationEl) paginationEl.innerHTML = '';
+        }
+
+        function ensureSkeletonStyles() {
+            if (document.getElementById('skeleton-styles')) return;
+            const s = document.createElement('style');
+            s.id = 'skeleton-styles';
+            s.textContent = `
+                .skeleton-row td { padding: 12px 8px; }
+                .skeleton { display:inline-block; width:100%; height:14px; background: linear-gradient(90deg,#eee,#f6f6f6,#eee); background-size:200% 100%; animation: shimmer 1.2s linear infinite; border-radius:4px }
+                @keyframes shimmer { 0% { background-position:200% 0 } 100% { background-position:-200% 0 } }
+            `;
+            document.head.appendChild(s);
+        }
+
+        function showSkeleton(count = 6) {
+            ensureSkeletonStyles();
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            for (let i = 0; i < count; i++) {
+                const tr = document.createElement('tr'); tr.className = 'nk-tb-item skeleton-row';
+                tr.innerHTML = `<td class="nk-tb-col"><span class="skeleton" style="width:40%"></span></td><td class="nk-tb-col tb-col-xl"><span class="skeleton" style="width:30%"></span></td><td class="nk-tb-col tb-col-xl"><span class="skeleton" style="width:60%"></span></td><td class="nk-tb-col tb-col-md"><span class="skeleton" style="width:35%"></span></td><td class="nk-tb-col nk-tb-col-tools"><span class="skeleton" style="width:60px;display:inline-block;height:28px;border-radius:6px"></span></td>`;
+                tbody.appendChild(tr);
+            }
+        }
+
+        function renderRows(items) {
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            items.forEach(it => {
+                const id = it._id || it.id || '';
+                const tr = document.createElement('tr');
+                tr.className = 'nk-tb-item';
+                tr.dataset.id = id;
+
+                const nameTd = document.createElement('td');
+                nameTd.className = 'nk-tb-col';
+                const projectInfo = document.createElement('div');
+                projectInfo.className = 'project-info';
+                const titleH6 = document.createElement('h6');
+                titleH6.className = 'title';
+                titleH6.textContent = it.name || 'Untitled';
+                projectInfo.appendChild(titleH6);
+                nameTd.appendChild(projectInfo);
+
+                const slugTd = document.createElement('td');
+                slugTd.className = 'nk-tb-col tb-col-xl';
+                const rawSlug = it.slug || '';
+                if (rawSlug && rawSlug !== (it.name || '')) slugTd.textContent = rawSlug;
+                else slugTd.textContent = slugify(it.name || '');
+
+                const descTd = document.createElement('td');
+                descTd.className = 'nk-tb-col tb-col-xl';
+                descTd.textContent = it.description || '';
+
+                const createdTd = document.createElement('td');
+                createdTd.className = 'nk-tb-col tb-col-md';
+                createdTd.textContent = formatDateShort(it.createdAt || it.created_at || it.createdAt);
+
+                const actionsTd = document.createElement('td');
+                actionsTd.className = 'nk-tb-col nk-tb-col-tools text-end';
+
+                const ul = document.createElement('ul'); 
+                ul.className = 'nk-tb-actions gx-1';
+                ul.style.justifyContent = 'flex-end';
+                ul.style.display = 'flex';
+                
+                const liEdit = document.createElement('li');
+                const aEdit = document.createElement('a'); 
+                aEdit.href = '#'; 
+                aEdit.className = 'btn btn-sm btn-icon btn-trigger'; 
+                aEdit.title = 'Edit'; 
+                aEdit.innerHTML = `<em class="icon ni ni-edit"></em>`;
+                liEdit.appendChild(aEdit);
+
+                const liDel = document.createElement('li');
+                const aDel = document.createElement('a'); 
+                aDel.href = '#'; 
+                aDel.className = 'btn btn-sm btn-icon btn-trigger text-danger'; 
+                aDel.title = 'Delete'; 
+                aDel.innerHTML = `<em class="icon ni ni-trash"></em>`;
+                liDel.appendChild(aDel);
+
+                ul.appendChild(liEdit); 
+                ul.appendChild(liDel);
+                actionsTd.appendChild(ul);
+
+                tr.appendChild(nameTd);
+                tr.appendChild(slugTd);
+                tr.appendChild(descTd);
+                tr.appendChild(createdTd);
+                tr.appendChild(actionsTd);
+
+                tbody.appendChild(tr);
+
+                // Edit handler: open edit modal and populate
+                aEdit.addEventListener('click', (ev) => {
+                    ev.preventDefault();
+                    if (!editForm) return;
+                    clearValidationErrors(editForm);
+                    if (editIdEl) editIdEl.value = id;
+                    if (editNameEl) editNameEl.value = it.name || '';
+                    if (editSlugEl) editSlugEl.value = it.slug || '';
+                    if (editDescEl) editDescEl.value = it.description || '';
+                    try { if (bsEditModal) bsEditModal.show(); } catch (e) { }
+                });
+
+                // Delete handler - open confirmation modal
+                aDel.addEventListener('click', (ev) => {
+                    ev.preventDefault();
+                    openDeleteModal(id, it.name || 'this category');
+                });
+            });
+        }
+
+        // edit form submission handling
+        if (editForm) {
+            editForm.addEventListener('submit', async (ev) => {
+                ev.preventDefault();
+                clearValidationErrors(editForm);
+                const id = (editIdEl || {}).value || '';
+                const payload = {
+                    name: (editNameEl || {}).value || '',
+                    slug: (editSlugEl || {}).value || '',
+                    description: (editDescEl || {}).value || ''
+                };
+                try {
+                    const token = getStoredToken();
+                    const headers = token ? { Authorization: 'Bearer ' + token } : {};
+                    const r = await api.put('/job-categories/' + encodeURIComponent(id), payload, { headers });
+                    if (r && (r.status === 200 || r.status === 204)) {
+                        try { if (bsEditModal) bsEditModal.hide(); } catch (e) { }
+                        if (typeof toast !== 'undefined') toast.success('Category updated');
+                        await loadCategories(currentPage);
+                    }
+                } catch (err) {
+                    if (err && err.response) {
+                        if (err.response.status === 401) {
+                            if (typeof toast !== 'undefined') toast.error('Unauthorized');
+                            return;
+                        }
+                        const body = err.response.data || {};
+                        const errors = body.errors || body.error || body.validation || body;
+                        showValidationErrors(editForm, errors);
+                        return;
+                    }
+                    console.error('Update failed', err);
+                    if (typeof toast !== 'undefined') toast.error('Update failed');
+                }
+            });
+        }
+
+        function renderPagination(page, limit, total) {
+            if (!paginationEl) return;
+            currentPage = Number(page) || 1;
+            const totalPages = Math.max(1, Math.ceil((total || 0) / (limit || PAGE_LIMIT)));
+            const frag = document.createDocumentFragment();
+
+            function makeLi(label, disabled, pageNum) {
+                const li = document.createElement('li'); li.className = 'page-item' + (disabled ? ' disabled' : '');
+                const a = document.createElement('a'); a.className = 'page-link'; a.href = '#'; a.textContent = label;
+                a.addEventListener('click', (ev) => { ev.preventDefault(); if (!disabled) loadCategories(pageNum, limit); });
+                li.appendChild(a);
+                return li;
+            }
+
+            frag.appendChild(makeLi('Prev', page <= 1, page - 1));
+
+            // simple center window
+            const start = Math.max(1, page - 2);
+            const end = Math.min(totalPages, page + 2);
+            for (let i = start; i <= end; i++) {
+                const li = document.createElement('li'); li.className = 'page-item' + (i === page ? ' active' : '');
+                const a = document.createElement('a'); a.className = 'page-link'; a.href = '#'; a.textContent = String(i);
+                a.addEventListener('click', (ev) => { ev.preventDefault(); loadCategories(i, limit); });
+                li.appendChild(a);
+                frag.appendChild(li);
+            }
+
+            frag.appendChild(makeLi('Next', page >= totalPages, page + 1));
+
+            paginationEl.innerHTML = '';
+            paginationEl.appendChild(frag);
+        }
+
+        // Open delete confirmation modal
+        function openDeleteModal(categoryId, categoryName) {
+            const modal = document.getElementById('deleteCategoryModal');
+            const nameEl = document.getElementById('delete-category-name');
+            const confirmBtn = document.getElementById('confirm-delete-category');
+            
+            if (!modal || !nameEl || !confirmBtn) return;
+            
+            nameEl.textContent = categoryName;
+            
+            // Remove old event listeners by cloning the button
+            const newConfirmBtn = confirmBtn.cloneNode(true);
+            confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+            
+            // Add new event listener
+            newConfirmBtn.addEventListener('click', async () => {
+                await deleteCategory(categoryId);
+                
+                // Close the modal
+                if (window.bootstrap) {
+                    const bsModal = bootstrap.Modal.getInstance(modal);
+                    if (bsModal) bsModal.hide();
+                }
+            });
+            
+            // Show the modal
+            if (window.bootstrap) {
+                const bsModal = new bootstrap.Modal(modal);
+                bsModal.show();
+            }
+        }
+
+        // Delete category
+        async function deleteCategory(categoryId) {
+            try {
+                const token = getStoredToken();
+                const headers = token ? { Authorization: 'Bearer ' + token } : {};
+                const r = await api.delete('/job-categories/' + encodeURIComponent(categoryId), { headers });
+                if (r && r.status === 200) {
+                    if (typeof toast !== 'undefined') toast.success('Category deleted successfully');
+                    await loadCategories(currentPage);
+                }
+            } catch (e) { 
+                console.error('Delete failed:', e); 
+                const msg = e?.response?.data?.message || e?.response?.data?.error || 'Delete failed';
+                if (typeof toast !== 'undefined') toast.error(msg); 
+            }
+        }
+
+        // initial load
+        await loadCategories(1, PAGE_LIMIT);
+        
+        // Search functionality
+        const searchInput = document.getElementById('category-search-input');
+        const searchInputMobile = document.getElementById('category-search-input-mobile');
+        let searchTimeout;
+        
+        function handleSearch(e) {
+            clearTimeout(searchTimeout);
+            const query = e.target.value.trim();
+            searchTimeout = setTimeout(() => {
+                currentPage = 1;
+                loadCategories(1, PAGE_LIMIT, query);
+            }, 500); // 500ms debounce
+        }
+        
+        if (searchInput) {
+            searchInput.addEventListener('input', handleSearch);
+        }
+        
+        if (searchInputMobile) {
+            searchInputMobile.addEventListener('input', handleSearch);
+        }
+    } catch (error) {
+        //console(error);
+    }
+
+})();
